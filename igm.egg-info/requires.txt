@@ -1,0 +1,11 @@
+numpy>=1.9
+scipy>=0.16
+h5py>=2.5
+alabtools>=0.0.1
+tqdm
+tornado
+cloudpickle
+cython
+
+[docs]
+Sphinx>=1.1

@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+
+{% block head %}<meta http-equiv="refresh" content="10">{% end %}
+
+{% block title %}Generation status{% end %}
+
+{% block body %}
+  <h1>
+    Job history
+  </h1>
+  <p> 
+    Directory: <strong>{{ directory }}</strong><br/>
+    Configuration file: <strong>{{ cfg_fname }}</strong> 
+  </p>
+  <h3>
+    Cluster status:
+  </h3>
+  <p>
+    workers: {{ cstatus[0] }}, ({{ cstatus[2] }} active, {{ cstatus[3] }} idle). queued jobs: {{ cstatus[1] }} 
+  </p>
+  <table class="table table-sm">
+    <thead class="thead-dark">
+      <th>
+        Step
+      </th>
+      <th>
+        Name
+      </th>
+      <th>
+        Time started
+      </th>
+      <th>
+        Time consumed
+      </th>
+      <th>
+        Total time
+      </th>
+      <th>
+        Status
+      </th>
+    </thead>
+  
+    <tbody>
+      {% for h in history %}
+        <tr {% if h['status'] == 'completed' %}class="table-success"{% end %}
+        {% if h['status'] == 'failed' %}class="table-danger"{% end %}>
+          <td>
+            {{ h['step_no'] }}
+          </td>
+          <td>
+            {{ h['name'] }}
+          </td>
+          <td>
+            {{ h['strtime'] }}
+          </td>
+          <td>
+            {{ h['consumed'] }}
+          </td>
+          <td>
+            +{{ h['elapsed'] }}
+          </td>
+          <td>
+            {{ h['status'] }}
+          </td>
+        </tr>
+      {% end %}
+    </tbody>
+  
+  </table>
+
+{% end %}

@@ -1,0 +1,11 @@
+Metadata-Version: 2.1
+Name: igm
+Version: 1.0.0
+Summary: Integrated Genome Modeling
+Home-page: https://github.com/alberlab/igm
+Author: Guido Polles, Nan Hua
+Author-email: polles@usc.edu nhua@usc.edu
+License: UNKNOWN
+Description: UNKNOWN
+Platform: UNKNOWN
+Provides-Extra: docs

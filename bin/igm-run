@@ -1,0 +1,354 @@
+#!/usr/bin/env python
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+import igm
+from igm.utils.emails import send_email
+import sys
+import atexit
+import os, os.path, time
+from shutil import copyfile, SameFileError
+import socket
+import json
+from multiprocessing import Process
+import traceback
+
+
+# specify the configuration.json file
+cfgfile = os.path.abspath(sys.argv[1])
+
+# create a process and pass a 'value' to it, which is the igm configuration file 
+def run_pipeline(cfgfile):
+    #===start pipeline with configure file
+    try:
+
+        pid = os.getpid()
+
+        # create a file with the process id to monitor it
+        with open('.igm-pid.txt', 'w') as f:
+            f.write(str(pid))
+
+        def rmfiles():
+            os.remove('.igm-pid.txt')
+
+        # register repulisti function to run at the end
+        atexit.register(rmfiles)
+
+        # read configuration file (.json) and get the parameters ready
+        cfg = igm.Config(cfgfile)
+
+        # Set up logger
+        igm.SetupLogging(cfg)
+        igm.logger.info('Starting pipeline. Configuration from ' + cfgfile)
+
+        # Preprocess genome, index and allocate disk space for genome structures
+        igm.Preprocess(cfg)
+        igm.logger.info('\n')
+
+        # Get initial coordinates: either read them from file...
+        starting_coordinates = cfg.get("model/starting_coordinates")
+
+        if starting_coordinates != '':
+            # make sure it is not a restart run
+            # step_db should not be there yet if it is a fresh start
+            if cfg.get('optimization/clean_restart', False) or (not os.path.isfile(cfg.get('parameters/step_db'))):
+                igm.logger.info('Initial coordinates from: ' + starting_coordinates)
+                try:
+                    copyfile(starting_coordinates, cfg.get("optimization/structure_output"))
+                except SameFileError:
+                    pass
+            #-
+        #-
+        # ... or generate random initial coordinates w territories and relax them to avoid steric clashes
+        """else:
+            igm.logger.info('Generating random initial coordinates...')
+            randomStep = igm.RandomInit(cfg)
+            randomStep.run()
+            igm.logger.info('\n')
+
+            igm.logger.info('Relaxing random configurations...')
+            relaxStep = igm.RelaxInit(cfg)
+            relaxStep.run()
+            igm.logger.info('\n')
+
+        igm.logger.info('Relaxation completed')
+        """
+
+        # initialize optimization iteration counter
+        opt_iter = 0
+
+        # min optimization iterations before proceeding to next set of step-wise threhsold values
+        # skipped if iter 0 is successful, if "min_iter" unsuccessful, force one additional iteration
+        min_iter = cfg.get("optimization/min_iterations", 5)
+
+        # max unsuccessful optimization iterations before stopping
+        # if even "max_iter" iterations do not lead to convergence, the pipeline exits with error message (see below)
+        max_iter = cfg.get("optimization/max_iterations", 12)
+
+        # ---- main A/M optimization loop, iterations ----#
+        while True:
+
+            # update "run_time" entry in configuration dictionary
+            cfg["runtime"]["opt_iter"] = opt_iter
+
+            # setup the needed restraint steps (Activation/Assignment) for this optimization iteration
+            iter_steps = []
+
+            # --- ASSIGNMENT STEP: population from previous iteration used to compute latent varaibles ---#
+            if 'nucleolus' in cfg['restraints']:
+                igm.logger.info('Using volume maps ...')
+
+            if 'Hi-C'      in cfg['restraints']:
+                iter_steps.append(igm.ActivationDistanceStep)
+                igm.logger.info('Using Hi-C data...')
+
+            if 'FISH'      in cfg['restraints']:
+                iter_steps.append(igm.FishAssignmentStep)
+                igm.logger.info('Using FISH data...')
+
+            if 'sprite'    in cfg['restraints']:
+                iter_steps.append(igm.SpriteAssignmentStep)
+                igm.logger.info('Using SPRITE data...')
+
+            if 'DamID'     in cfg['restraints']:
+                iter_steps.append(igm.DamidActivationDistanceStep)
+                igm.logger.info('Using DamID data...')
+
+            # --- MODELING STEP: each non zero latent variable entry is a spatial restraint added to structure H run a modeling step
+            #    use lammps for a simulated annealing/conjugate gradient optimization step, find energetic minimum, in step.run()
+            iter_steps.append(igm.ModelingStep)
+
+            # if "Hi-C evalutation" is True, setup the required steps for evaluations
+            if cfg.get("restraints/Hi-C/run_evaluation_step", False):
+                iter_steps.append(igm.HicEvaluationStep)
+                igm.logger.info('Running Hi-C evaluation step...')
+
+            #igm.logger.info('Running the following steps ' + str(iter_steps))
+            #igm.logger.info('\n\n')
+
+            # run all the steps from master list "iter_steps"
+            for StepClass in iter_steps:
+                step = StepClass(cfg)
+                step.run()
+                igm.logger.info('\n')
+
+            igm.logger.info('A/M iteration OK, now checking violations')
+
+            # -------- check the violations ------ #
+
+            # the modeled population is acceptable if violations (in cfg["runtime"]) are under a certain threshold (in cfg["optimization"])
+            # "is_acceptable" = True, if violation score is smaller than tolerance
+            is_acceptable = cfg.get("runtime/violation_score") < cfg.get("optimization/max_violations")    # this is cumulative
+
+            igm.logger.info('Violation score from iteration   = ' + str(cfg.get("runtime/violation_score")))
+            igm.logger.info('Violation score setup threshold  = ' + str(cfg.get("optimization/max_violations")))
+
+            # HiC: "is_his_incomplete' = True, if there are still HiC-sigma values to explore
+            is_hic_incomplete = (
+                ('Hi-C' in cfg['restraints']) and
+                (
+                    (len(cfg.get("runtime/Hi-C/intra_sigma_list")) != 0) or
+                    (len(cfg.get("runtime/Hi-C/inter_sigma_list")) != 0)
+                )
+            )
+            is_hic_done = not is_hic_incomplete
+
+            # Damid: "is_damid_incomplete" = True, if there are still DamiD-sigma values to explore
+            is_damid_incomplete = ( 
+                ('DamID' in cfg['restraints'] ) and 
+                    ( len( cfg.get("runtime/DamID/sigma_list") ) != 0 )
+            )
+            is_damid_done = not is_damid_incomplete
+
+            # FISH "is_fish_incomplete" = True, if there are still fish_tol values to explore
+            is_fish_incomplete = (
+                ('FISH' in cfg['restraints']) and 
+                    ( len( cfg.get("runtime/FISH/tol_list")) !=0 )
+            )
+            is_fish_done = not is_fish_incomplete
+
+            # SPRITE "is_sprite_incomplete" = True, if there are still volume_occupancy  values to explore
+            is_sprite_incomplete = (
+                ('sprite' in cfg['restraints']) and
+                    ( len( cfg.get("runtime/sprite/volume_fraction_list")) !=0 )
+            )
+            is_sprite_done = not is_sprite_incomplete
+
+            # if min_iter iterations have not been run yet, and at least one iteration has been run...
+            force_next_iteration = (opt_iter < min_iter - 1) and ( opt_iter != 0 )
+
+            # force next iteration if all data have been included, but only one restraint optimization iteration was run
+            # this circumvents the "force_last_iteration = False" in the configuration file
+            if  (
+                    cfg.get('optimization/force_last_iteration', False) and
+                    is_hic_done and is_damid_done and is_fish_done and is_sprite_done and 
+                    opt_iter == 0
+                ):
+                force_next_iteration = True
+
+            # force next iteration if below a certain threshold and only one restraint optimization iteration was run
+            if  (
+                    'Hi-C' in cfg['restraints'] and
+                    opt_iter == 0 and
+                    cfg.get("runtime/Hi-C/intra_sigma") <= cfg.get('optimization/force_minimum_iterations_hic_cutoff', 0.0)
+                ):
+                force_next_iteration = True
+
+            # if sufficiently low number of violations(is_acceptable = 0)  and there is no need to force additional iterations (force_next_iteration = 0)...
+            if is_acceptable and not force_next_iteration:
+
+                igm.logger.info('Violations are acceptable, no need to force another A/M iteration: add extra data batches...')
+
+                # ... all good, either go to the next parameter set...
+
+                if is_hic_incomplete:
+                    # ... remove current HiC sigma value from cfg["runtime"], and move on to the next
+                    del cfg["runtime"]["Hi-C"]["intra_sigma"]
+                    del cfg["runtime"]["Hi-C"]["inter_sigma"]
+                    # reset iteration number counter
+                    opt_iter = 0
+
+                if is_damid_incomplete:
+                    # ... remove current DamiD sigma value from cfg["runtime"], and move on to the next
+                    del cfg["runtime"]["DamID"]["sigma"]
+                    # reset iteration number counter
+                    opt_iter = 0
+
+                if is_fish_incomplete:
+                    # ... remove current DamiD sigma value from cfg["runtime"], and move on to the next
+                    del cfg["runtime"]["FISH"]["tol"]
+                    # reset iteration number counter
+                    opt_iter = 0
+
+                if is_sprite_incomplete:
+                    # ... remove current DamiD sigma value from cfg["runtime"], and move on to the next
+                    del cfg["runtime"]["sprite"]["volume_fraction"]
+                    # reset iteration number counter
+                    opt_iter = 0
+
+
+                # ... or, if lists of thresholds have been swept over fully, exit the pipeline successfully
+                if is_hic_done and is_damid_done and is_fish_done and is_sprite_done:
+
+                    igm.logger.info('Pipeline completed')
+                    open('completed', 'w').close()
+                    
+                    if cfg.get('email_notifications', False):
+                        send_email(
+                            cfg.get('email_notifications'),
+                            subject='IGM automatic notifications (Success)',
+                            content='IGM completed succesfully.\ncfg_file: ' + cfgfile
+                        )
+                    break
+            else:
+
+                # move on to the next optimization iteration, since either violation score is still larger than tolerance,
+                # or another iteration is forced anyway
+                opt_iter += 1
+
+                if max_iter is not None:
+
+                    # if maximum number of iterations reached, then raise error
+                    if opt_iter >= max_iter:
+                        igm.logger.critical('Maximum number of iterations reached (%d)' % max_iter)
+                        if cfg.get('email_notifications', False):
+                            send_email(
+                                cfg.get('email_notifications'),
+                                subject='IGM automatic notifications (Maximum iterations reached)',
+                                content='IGM could not optimize fully.\ncfg_file: ' + cfgfile
+                            )
+                        break
+
+                # if violations are acceptable, force next iteratiron for the same set of parameters
+                if is_acceptable:
+                    igm.logger.info('Violations acceptable; yet, minimum number of required iterations not reached')
+                
+                igm.logger.info('iteration # %d' % opt_iter)
+                igm.logger.info('\n\n')
+
+    except KeyboardInterrupt:
+        igm.logger.error('Interrupt Signal received. Stopping IGM.')
+
+    except:
+        if cfg.get('email_notifications', False):
+            send_email(
+                cfg.get('email_notifications'),
+                subject='IGM automatic notifications (Failure)',
+                content='IGM got an exception.\n' + traceback.format_exc()
+            )
+        raise
+
+# start the run as a subprocess
+print('[CONTROL] Starting Integrated Genome Modeling run...')
+p = Process(target=run_pipeline, args=(cfgfile, ))
+p.start()
+
+
+# try to gracefully kill the run
+def kill_igm():
+    try:
+        pid = int(open('.igm-pid.txt', 'r').read())
+        for i in range(3):
+            if p.is_alive():
+                os.kill(pid, 2)
+                time.sleep(1)
+        if p.is_alive():
+            time.sleep(5)
+            os.kill(pid, 9)  # now we really kill it - which probably will kill this process as well
+    except ProcessLookupError:
+        pass
+    finally:
+        p.join()
+
+
+# create a socket to eventually kill the run
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    os.remove(".igm-socket")
+except OSError:
+    pass
+s.bind(".igm-socket")
+s.settimeout(1)
+s.listen(1)
+while 1:
+
+    try:
+        conn = None
+        conn, addr = s.accept()
+        data = conn.recv(4096)
+        conn.close()
+
+    except socket.timeout:
+        if not p.is_alive(): # exit if the igm process died
+            break
+        continue
+
+    except KeyboardInterrupt:
+        print('[CONTROL] Keyboard interrupt received. Trying to gracefully terminate IGM...')
+        kill_igm()
+        break
+
+    try:
+        data = json.loads(data)
+        if data['q'] == 'kill':
+            print('[CONTROL] Kill signal received. Trying to gracefully terminate IGM...')
+            kill_igm()
+            break
+    except:
+        print('[CONTROL] Invalid data received:', str(data))
+
+p.join()
+
+try:
+    os.remove(".igm-socket")
+except OSError:
+    pass
+
+try:
+    os.remove(".igm-pid.txt")
+except OSError:
+    pass
+
+print('[CONTROL] Exiting')
+print('\n')
+print('[CONTROL] IGM run successfully completed, the igm-model.hss file containts the details of the optimized data-driven population! Please shut down the controller and the workers')
