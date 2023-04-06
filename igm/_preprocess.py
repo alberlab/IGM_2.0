@@ -13,7 +13,7 @@ from shutil import copyfile
 #===prepare genome and index instances
 def PrepareGenomeIndex(cfg):
 
-    """ Prepare genome and index instances, use Alabtools utilities
+    """ Prepare genome and index instances, use Alabtools utilities!
 
 	cfg: configuration file object, as from igm.config() 
     """
