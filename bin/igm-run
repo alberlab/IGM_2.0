@@ -59,7 +59,7 @@ def run_pipeline(cfgfile):
             #-
         #-
         # ... or generate random initial coordinates w territories and relax them to avoid steric clashes
-        """else:
+        else:
             igm.logger.info('Generating random initial coordinates...')
             randomStep = igm.RandomInit(cfg)
             randomStep.run()
@@ -70,8 +70,7 @@ def run_pipeline(cfgfile):
             relaxStep.run()
             igm.logger.info('\n')
 
-        igm.logger.info('Relaxation completed')
-        """
+            igm.logger.info('Relaxation completed')
 
         # initialize optimization iteration counter
         opt_iter = 0
